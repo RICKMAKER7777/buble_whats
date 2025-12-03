@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-api-bubble",
+  "version": "1.0.0",
+  "description": "API simples para WhatsApp para usar com Bubble.io",
+  "main": "api.js",
+  "scripts": {
+    "start": "node api.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "whatsapp-web.js": "^1.23.0",
+    "qrcode": "^1.5.3",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
