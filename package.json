@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-api-bubble",
-  "version": "3.0.0",
-  "description": "API WhatsApp para Bubble.io (compatível Render Free)",
+  "version": "1.0.0",
+  "description": "API WhatsApp para Bubble.io",
   "main": "api.js",
   "scripts": {
     "start": "node api.js",
