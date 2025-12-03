@@ -1,33 +1,135 @@
 const express = require('express');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode-terminal');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
-// Armazenamento em memória (será persistido via variáveis de ambiente)
+// Armazenamento em memória
 let sessions = {};
-let sessionStates = {};
 
-// Carregar sessões salvas das variáveis de ambiente
-if (process.env.WHATSAPP_SESSIONS) {
-    try {
-        sessions = JSON.parse(Buffer.from(process.env.WHATSAPP_SESSIONS, 'base64').toString());
-    } catch (e) {
-        console.log('Nenhuma sessão salva encontrada');
-    }
+// Criar pasta para sessões
+const SESSIONS_DIR = './sessions';
+if (!fs.existsSync(SESSIONS_DIR)) {
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Função para salvar sessões em base64 (para persistência)
-function saveSessions() {
-    const sessionsBase64 = Buffer.from(JSON.stringify(sessions)).toString('base64');
-    console.log(`SESSIONS_BASE64: ${sessionsBase64}`);
-    // No Render, você pode configurar esta variável de ambiente manualmente
-    // ou usar o painel para atualizar após cada reinicialização
+// Função para inicializar conexão WhatsApp
+async function startWhatsAppSession(sessionId) {
+    const sessionPath = path.join(SESSIONS_DIR, sessionId);
+    
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    
+    const { version } = await fetchLatestBaileysVersion();
+    
+    const sock = makeWASocket({
+        version,
+        printQRInTerminal: false,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, () => {}),
+        },
+        browser: ['Bubble WhatsApp', 'Chrome', '1.0.0'],
+    });
+
+    // Salvar credenciais quando atualizadas
+    sock.ev.on('creds.update', saveCreds);
+
+    // Evento de QR Code
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            console.log(`QR Code recebido para ${sessionId}`);
+            // Gerar QR Code em terminal e base64
+            qrcode.generate(qr, { small: true });
+            
+            // Converter QR para base64
+            const qrBuffer = Buffer.from(qr);
+            const qrBase64 = qrBuffer.toString('base64');
+            const qrDataURL = `data:image/png;base64,${qrBase64}`;
+            
+            sessions[sessionId].qrCode = qrDataURL;
+            sessions[sessionId].isAuthenticated = false;
+        }
+
+        if (connection === 'open') {
+            console.log(`WhatsApp conectado para sessão: ${sessionId}`);
+            sessions[sessionId].isAuthenticated = true;
+            sessions[sessionId].qrCode = null;
+            sessions[sessionId].user = sock.user;
+        }
+
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log(`Conexão fechada. Reconectar? ${shouldReconnect}`);
+            
+            if (shouldReconnect) {
+                startWhatsAppSession(sessionId);
+            } else {
+                delete sessions[sessionId];
+                // Limpar pasta da sessão
+                if (fs.existsSync(sessionPath)) {
+                    fs.rmSync(sessionPath, { recursive: true });
+                }
+            }
+        }
+    });
+
+    // Receber mensagens
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.message) return; // Ignorar mensagens vazias
+        
+        const messageData = {
+            id: msg.key.id,
+            from: msg.key.remoteJid,
+            pushName: msg.pushName,
+            timestamp: msg.messageTimestamp,
+            body: msg.message.conversation || 
+                  msg.message.extendedTextMessage?.text ||
+                  '[Mídia ou outro tipo]',
+            type: Object.keys(msg.message)[0]
+        };
+
+        // Se for mídia
+        if (msg.message.imageMessage || msg.message.videoMessage || msg.message.audioMessage) {
+            try {
+                const mediaType = msg.message.imageMessage ? 'image' : 
+                                 msg.message.videoMessage ? 'video' : 'audio';
+                const mediaMsg = msg.message[`${mediaType}Message`];
+                
+                messageData.media = {
+                    type: mediaType,
+                    mimetype: mediaMsg.mimetype,
+                    caption: mediaMsg.caption,
+                    url: mediaMsg.url
+                };
+            } catch (e) {
+                console.error('Erro ao processar mídia:', e);
+            }
+        }
+
+        if (!sessions[sessionId].messages) {
+            sessions[sessionId].messages = [];
+        }
+        
+        sessions[sessionId].messages.push(messageData);
+        
+        // Manter apenas últimas 100 mensagens
+        if (sessions[sessionId].messages.length > 100) {
+            sessions[sessionId].messages = sessions[sessionId].messages.slice(-100);
+        }
+    });
+
+    return sock;
 }
 
 // 1. INICIAR SESSÃO
@@ -38,82 +140,27 @@ app.post('/sessions/start', async (req, res) => {
         return res.status(400).json({ error: 'Sessão já existe' });
     }
 
-    const client = new Client({
-        authStrategy: new LocalAuth({ clientId: sessionId }),
-        puppeteer: {
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        }
-    });
-
     sessions[sessionId] = {
-        client: client,
-        qrCode: null,
         isAuthenticated: false,
-        messages: []
+        qrCode: null,
+        messages: [],
+        user: null
     };
 
-    sessionStates[sessionId] = {
-        qr: null,
-        ready: false
-    };
-
-    client.on('qr', async (qr) => {
-        sessionStates[sessionId].qr = qr;
-        sessions[sessionId].qrCode = await qrcode.toDataURL(qr);
-    });
-
-    client.on('ready', () => {
-        console.log(`Sessão ${sessionId} pronta!`);
-        sessions[sessionId].isAuthenticated = true;
-        sessionStates[sessionId].ready = true;
-        saveSessions();
-    });
-
-    client.on('message', async (msg) => {
-        const messageData = {
-            id: msg.id._serialized,
-            from: msg.from,
-            to: msg.to,
-            body: msg.body,
-            timestamp: msg.timestamp,
-            hasMedia: msg.hasMedia,
-            type: msg.type
-        };
-
-        if (msg.hasMedia) {
-            try {
-                const media = await msg.downloadMedia();
-                messageData.media = {
-                    data: media.data,
-                    mimetype: media.mimetype,
-                    filename: media.filename
-                };
-            } catch (e) {
-                console.error('Erro ao baixar mídia:', e);
-            }
-        }
-
-        sessions[sessionId].messages.push(messageData);
+    try {
+        const sock = await startWhatsAppSession(sessionId);
+        sessions[sessionId].sock = sock;
         
-        // Limitar histórico a 100 mensagens
-        if (sessions[sessionId].messages.length > 100) {
-            sessions[sessionId].messages = sessions[sessionId].messages.slice(-100);
-        }
-    });
-
-    client.on('disconnected', (reason) => {
-        console.log(`Sessão ${sessionId} desconectada:`, reason);
+        res.json({ 
+            success: true, 
+            sessionId: sessionId,
+            message: 'Sessão iniciada. Use /sessions/[id]/qr para obter QR Code'
+        });
+    } catch (error) {
+        console.error('Erro ao iniciar sessão:', error);
         delete sessions[sessionId];
-        delete sessionStates[sessionId];
-    });
-
-    client.initialize();
-
-    res.json({ 
-        success: true, 
-        sessionId: sessionId,
-        message: 'Sessão iniciada. Use o endpoint /sessions/[id]/qr para obter QR Code'
-    });
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // 2. LISTAR SESSÕES
@@ -121,7 +168,11 @@ app.get('/sessions', (req, res) => {
     const sessionList = Object.keys(sessions).map(id => ({
         id: id,
         isAuthenticated: sessions[id].isAuthenticated,
-        status: sessionStates[id]?.ready ? 'ready' : 'waiting_qr'
+        user: sessions[id].user ? {
+            id: sessions[id].user.id,
+            name: sessions[id].user.name
+        } : null,
+        messageCount: sessions[id].messages?.length || 0
     }));
     res.json(sessionList);
 });
@@ -138,7 +189,8 @@ app.get('/sessions/:id/qr', async (req, res) => {
     if (session.isAuthenticated) {
         return res.json({ 
             status: 'authenticated',
-            message: 'Sessão já autenticada' 
+            message: 'Sessão já autenticada',
+            user: session.user
         });
     }
 
@@ -148,7 +200,7 @@ app.get('/sessions/:id/qr', async (req, res) => {
             status: 'waiting_qr'
         });
     } else {
-        // Aguardar QR Code por 30 segundos
+        // Aguardar QR Code
         let attempts = 0;
         const checkQR = setInterval(() => {
             if (session.qrCode) {
@@ -167,26 +219,7 @@ app.get('/sessions/:id/qr', async (req, res) => {
     }
 });
 
-// 4. REINICIAR SESSÃO
-app.post('/sessions/:id/restore', (req, res) => {
-    const sessionId = req.params.id;
-    
-    if (!sessions[sessionId]) {
-        return res.status(404).json({ error: 'Sessão não encontrada' });
-    }
-
-    try {
-        sessions[sessionId].client.destroy();
-        setTimeout(() => {
-            sessions[sessionId].client.initialize();
-            res.json({ success: true, message: 'Sessão reiniciada' });
-        }, 1000);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 5. ENVIAR MENSAGEM DE TEXTO
+// 4. ENVIAR MENSAGEM DE TEXTO
 app.post('/sessions/:id/send-message', async (req, res) => {
     const sessionId = req.params.id;
     const { number, message } = req.body;
@@ -204,26 +237,28 @@ app.post('/sessions/:id/send-message', async (req, res) => {
     }
 
     try {
-        // Formatar número (remover caracteres especiais, adicionar @c.us)
-        const formattedNumber = number.replace(/\D/g, '') + '@c.us';
-        const client = sessions[sessionId].client;
+        const sock = sessions[sessionId].sock;
         
-        const result = await client.sendMessage(formattedNumber, message);
+        // Formatar número
+        const formattedNumber = number.replace(/\D/g, '') + '@s.whatsapp.net';
+        
+        const result = await sock.sendMessage(formattedNumber, { text: message });
         
         res.json({ 
             success: true, 
-            messageId: result.id._serialized,
-            timestamp: result.timestamp
+            messageId: result.key.id,
+            timestamp: new Date().getTime()
         });
     } catch (error) {
+        console.error('Erro ao enviar mensagem:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 6. ENVIAR IMAGEM/MÍDIA
+// 5. ENVIAR IMAGEM
 app.post('/sessions/:id/send-media', async (req, res) => {
     const sessionId = req.params.id;
-    const { number, base64Data, mimeType, caption, filename } = req.body;
+    const { number, base64Data, mimeType, caption } = req.body;
     
     if (!sessions[sessionId]) {
         return res.status(404).json({ error: 'Sessão não encontrada' });
@@ -240,23 +275,30 @@ app.post('/sessions/:id/send-media', async (req, res) => {
     }
 
     try {
-        const formattedNumber = number.replace(/\D/g, '') + '@c.us';
-        const client = sessions[sessionId].client;
+        const sock = sessions[sessionId].sock;
+        const formattedNumber = number.replace(/\D/g, '') + '@s.whatsapp.net';
         
-        const media = new MessageMedia(mimeType, base64Data, filename);
-        const result = await client.sendMessage(formattedNumber, media, { caption: caption });
+        // Converter base64 para buffer
+        const buffer = Buffer.from(base64Data.split(',')[1] || base64Data, 'base64');
+        
+        const result = await sock.sendMessage(formattedNumber, {
+            image: buffer,
+            mimetype: mimeType,
+            caption: caption
+        });
         
         res.json({ 
             success: true, 
-            messageId: result.id._serialized,
-            timestamp: result.timestamp
+            messageId: result.key.id,
+            timestamp: new Date().getTime()
         });
     } catch (error) {
+        console.error('Erro ao enviar mídia:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 7. RECEBER MENSAGENS (HISTÓRICO)
+// 6. RECEBER MENSAGENS
 app.get('/sessions/:id/messages', (req, res) => {
     const sessionId = req.params.id;
     
@@ -266,12 +308,12 @@ app.get('/sessions/:id/messages', (req, res) => {
 
     res.json({
         success: true,
-        count: sessions[sessionId].messages.length,
-        messages: sessions[sessionId].messages
+        count: sessions[sessionId].messages?.length || 0,
+        messages: sessions[sessionId].messages || []
     });
 });
 
-// 8. STATUS DA SESSÃO
+// 7. STATUS DA SESSÃO
 app.get('/sessions/:id/status', (req, res) => {
     const sessionId = req.params.id;
     
@@ -282,9 +324,35 @@ app.get('/sessions/:id/status', (req, res) => {
     res.json({
         isAuthenticated: sessions[sessionId].isAuthenticated,
         qrAvailable: !!sessions[sessionId].qrCode,
-        messageCount: sessions[sessionId].messages.length,
-        status: sessionStates[sessionId]?.ready ? 'ready' : 'waiting_qr'
+        messageCount: sessions[sessionId].messages?.length || 0,
+        user: sessions[sessionId].user,
+        status: sessions[sessionId].isAuthenticated ? 'ready' : 'waiting_qr'
     });
+});
+
+// 8. REINICIAR SESSÃO
+app.post('/sessions/:id/restore', async (req, res) => {
+    const sessionId = req.params.id;
+    
+    if (!sessions[sessionId]) {
+        return res.status(404).json({ error: 'Sessão não encontrada' });
+    }
+
+    try {
+        if (sessions[sessionId].sock) {
+            await sessions[sessionId].sock.end();
+        }
+        
+        // Recomeçar sessão
+        const sock = await startWhatsAppSession(sessionId);
+        sessions[sessionId].sock = sock;
+        sessions[sessionId].isAuthenticated = false;
+        sessions[sessionId].qrCode = null;
+        
+        res.json({ success: true, message: 'Sessão reiniciada' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // 9. DESTRUIR SESSÃO
@@ -296,36 +364,20 @@ app.delete('/sessions/:id', async (req, res) => {
     }
 
     try {
-        await sessions[sessionId].client.destroy();
-        delete sessions[sessionId];
-        delete sessionStates[sessionId];
-        saveSessions();
+        if (sessions[sessionId].sock) {
+            await sessions[sessionId].sock.end();
+        }
         
+        // Remover pasta da sessão
+        const sessionPath = path.join(SESSIONS_DIR, sessionId);
+        if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true });
+        }
+        
+        delete sessions[sessionId];
         res.json({ success: true, message: 'Sessão destruída' });
     } catch (error) {
         res.status(500).json({ error: error.message });
-    }
-});
-
-// Endpoint para obter sessões em base64 (para backup)
-app.get('/backup-sessions', (req, res) => {
-    const sessionsBase64 = Buffer.from(JSON.stringify(sessions)).toString('base64');
-    res.json({ sessions: sessionsBase64 });
-});
-
-// Endpoint para restaurar sessões do backup
-app.post('/restore-sessions', (req, res) => {
-    const { sessionsBase64 } = req.body;
-    
-    if (!sessionsBase64) {
-        return res.status(400).json({ error: 'sessionsBase64 é obrigatório' });
-    }
-
-    try {
-        sessions = JSON.parse(Buffer.from(sessionsBase64, 'base64').toString());
-        res.json({ success: true, message: 'Sessões restauradas' });
-    } catch (error) {
-        res.status(500).json({ error: 'Erro ao restaurar sessões' });
     }
 });
 
@@ -333,22 +385,22 @@ app.post('/restore-sessions', (req, res) => {
 app.get('/', (req, res) => {
     res.json({ 
         status: 'online',
+        version: 'Baileys WhatsApp API',
         sessions: Object.keys(sessions).length,
         endpoints: [
             'POST /sessions/start',
             'GET /sessions',
             'GET /sessions/:id/qr',
-            'POST /sessions/:id/restore',
             'POST /sessions/:id/send-message',
             'POST /sessions/:id/send-media',
             'GET /sessions/:id/messages',
             'GET /sessions/:id/status',
+            'POST /sessions/:id/restore',
             'DELETE /sessions/:id'
         ]
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`API WhatsApp rodando na porta ${PORT}`);
-    console.log(`Sessões carregadas: ${Object.keys(sessions).length}`);
+    console.log(`WhatsApp Baileys API rodando na porta ${PORT}`);
 });
